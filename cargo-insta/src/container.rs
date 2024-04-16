@@ -134,6 +134,10 @@ impl SnapshotContainer {
         &self.target_path
     }
 
+    pub(crate) fn snapshot_path(&self) -> &Path {
+        &self.snapshot_path
+    }
+
     pub(crate) fn snapshot_file(&self) -> Option<&Path> {
         match self.kind {
             SnapshotContainerKind::External => Some(&self.target_path),

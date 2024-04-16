@@ -6,6 +6,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use image::DynamicImage;
+
 use crate::content::{self, json, yaml, Content};
 
 lazy_static::lazy_static! {
@@ -128,6 +130,18 @@ impl PendingInlineSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SnapshotType {
+    Str,
+    Image,
+}
+
+impl Default for SnapshotType {
+    fn default() -> Self {
+        SnapshotType::Str
+    }
+}
+
 /// Snapshot metadata information.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct MetaData {
@@ -143,6 +157,8 @@ pub struct MetaData {
     pub(crate) info: Option<Content>,
     /// Reference to the input file.
     pub(crate) input_file: Option<String>,
+    /// The type of the snapshot.
+    pub(crate) snapshot_type: SnapshotType,
 }
 
 impl MetaData {
@@ -196,6 +212,7 @@ impl MetaData {
             let mut expression = None;
             let mut info = None;
             let mut input_file = None;
+            let mut snapshot_type = SnapshotType::Str;
 
             for (key, value) in map.into_iter() {
                 match key.as_str() {
@@ -205,6 +222,12 @@ impl MetaData {
                     Some("expression") => expression = value.as_str().map(Into::into),
                     Some("info") if !value.is_nil() => info = Some(value),
                     Some("input_file") => input_file = value.as_str().map(Into::into),
+                    Some("snapshot_type") => {
+                        snapshot_type = match value.as_str() {
+                            Some("image") => SnapshotType::Image,
+                            _ => SnapshotType::Str,
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -216,6 +239,7 @@ impl MetaData {
                 expression,
                 info,
                 input_file,
+                snapshot_type,
             })
         } else {
             Err(content::Error::UnexpectedDataType.into())
@@ -242,6 +266,14 @@ impl MetaData {
         if let Some(input_file) = self.input_file.as_deref() {
             fields.push(("input_file", Content::from(input_file)));
         }
+
+        fields.push((
+            "snapshot_type",
+            Content::from(match self.snapshot_type {
+                SnapshotType::Str => "str",
+                SnapshotType::Image => "image",
+            }),
+        ));
 
         Content::Struct("MetaData", fields)
     }
@@ -314,14 +346,28 @@ impl Snapshot {
             rv
         };
 
-        buf.clear();
-        for (idx, line) in f.lines().enumerate() {
-            let line = line?;
-            if idx > 0 {
-                buf.push('\n');
+        let contents = match metadata.snapshot_type {
+            SnapshotType::Str => {
+                buf.clear();
+                for (idx, line) in f.lines().enumerate() {
+                    let line = line?;
+                    if idx > 0 {
+                        buf.push('\n');
+                    }
+                    buf.push_str(&line);
+                }
+
+                SnapshotContents::Str(buf)
             }
-            buf.push_str(&line);
-        }
+            SnapshotType::Image => {
+                let mut png_path = p.to_path_buf();
+                let mut ext = png_path.extension().unwrap().to_os_string();
+                ext.push(".png");
+                png_path.set_extension(ext);
+
+                SnapshotContents::Image(image::open(png_path)?)
+            }
+        };
 
         let module_name = p
             .file_name()
@@ -349,7 +395,7 @@ impl Snapshot {
             module_name,
             snapshot_name,
             metadata,
-            buf.into(),
+            contents,
         ))
     }
 
@@ -368,6 +414,15 @@ impl Snapshot {
         }
     }
 
+    pub fn image_path(path: &Path) -> PathBuf {
+        // just png for now
+        let mut png_path = path.to_path_buf();
+        let mut ext = png_path.extension().unwrap().to_os_string();
+        ext.push(".png");
+        png_path.set_extension(ext);
+        png_path
+    }
+
     #[cfg(feature = "_cargo_insta_internal")]
     fn from_content(content: Content) -> Result<Snapshot, Box<dyn Error>> {
         if let Content::Map(map) = content {
@@ -382,7 +437,7 @@ impl Snapshot {
                     Some("snapshot_name") => snapshot_name = value.as_str().map(|x| x.to_string()),
                     Some("metadata") => metadata = Some(MetaData::from_content(value)?),
                     Some("snapshot") => {
-                        snapshot = Some(SnapshotContents(
+                        snapshot = Some(SnapshotContents::Str(
                             value
                                 .as_str()
                                 .ok_or(content::Error::UnexpectedDataType)?
@@ -410,7 +465,10 @@ impl Snapshot {
             fields.push(("snapshot_name", Content::from(name)));
         }
         fields.push(("metadata", self.metadata.as_content()));
-        fields.push(("snapshot", Content::from(self.snapshot.0.as_str())));
+
+        if let Some(content) = self.snapshot.as_str() {
+            fields.push(("snapshot", Content::from(content)));
+        }
 
         Content::Struct("Content", fields)
     }
@@ -446,15 +504,19 @@ impl Snapshot {
     }
 
     /// The snapshot contents as a &str
-    pub fn contents_str(&self) -> &str {
+    pub fn contents_str(&self) -> Option<&str> {
         self.snapshot.as_str()
     }
 
     fn serialize_snapshot(&self, md: &MetaData) -> String {
         let mut buf = yaml::to_string(&md.as_content());
         buf.push_str("---\n");
-        buf.push_str(self.contents_str());
-        buf.push('\n');
+
+        if let Some(contents_str) = self.contents_str() {
+            buf.push_str(contents_str);
+            buf.push('\n');
+        }
+
         buf
     }
 
@@ -470,19 +532,37 @@ impl Snapshot {
 
         let serialized_snapshot = self.serialize_snapshot(md);
 
+        let ref_path = ref_file.unwrap_or(path);
+
         // check the reference file for contents.  Note that we always want to
         // compare snapshots that were trimmed to persistence here.
-        if let Ok(old) = fs::read_to_string(ref_file.unwrap_or(path)) {
+        if let Ok(old) = fs::read_to_string(ref_path) {
             let persisted = match md.trim_for_persistence() {
                 Cow::Owned(trimmed) => Cow::Owned(self.serialize_snapshot(&trimmed)),
                 Cow::Borrowed(_) => Cow::Borrowed(&serialized_snapshot),
             };
-            if old == persisted.as_str() {
+
+            if old == persisted.as_str()
+                // Either both the metadata and the image get written or none of the two.
+                && if let SnapshotContents::Image(snapshot_image) = &self.snapshot {
+                    &image::open(Self::image_path(ref_path))? == snapshot_image
+                } else {
+                    true
+                }
+            {
                 return Ok(false);
             }
         }
 
         fs::write(path, serialized_snapshot)?;
+
+        match self.snapshot {
+            SnapshotContents::Image(ref image) => {
+                image.save(Self::image_path(path))?;
+            }
+            _ => (),
+        }
+
         Ok(true)
     }
 
@@ -512,54 +592,73 @@ impl Snapshot {
 }
 
 /// The contents of a Snapshot
-// Could be Cow, but I think limited savings
-#[derive(Debug, Clone)]
-pub struct SnapshotContents(String);
+#[derive(Debug, Clone, PartialEq)]
+pub enum SnapshotContents {
+    // Could be Cow, but I think limited savings
+    Str(String),
+    Image(DynamicImage),
+}
 
 impl SnapshotContents {
     pub fn from_inline(value: &str) -> SnapshotContents {
-        SnapshotContents(get_inline_snapshot_value(value))
+        SnapshotContents::Str(get_inline_snapshot_value(value))
+    }
+
+    pub fn is_str(&self) -> bool {
+        matches!(self, SnapshotContents::Str(_))
+    }
+
+    pub fn is_image(&self) -> bool {
+        matches!(self, SnapshotContents::Image(_))
     }
 
     /// Returns the snapshot contents as string with surrounding whitespace removed.
-    pub fn as_str(&self) -> &str {
-        self.0
-            .trim_start_matches(|x| x == '\r' || x == '\n')
-            .trim_end()
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            SnapshotContents::Str(content) => Some(
+                content
+                    .trim_start_matches(|x| x == '\r' || x == '\n')
+                    .trim_end(),
+            ),
+            SnapshotContents::Image(_) => None,
+        }
     }
 
-    pub fn to_inline(&self, indentation: usize) -> String {
-        let contents = &self.0;
-        let mut out = String::new();
-        let is_escape = contents.contains(&['\n', '\\', '"'][..]);
+    pub fn to_inline(&self, indentation: usize) -> Option<String> {
+        if let SnapshotContents::Str(ref contents) = self {
+            let mut out = String::new();
+            let is_escape = contents.contains(&['\n', '\\', '"'][..]);
 
-        out.push_str(if is_escape { "r###\"" } else { "\"" });
-        // if we have more than one line we want to change into the block
-        // representation mode
-        if contents.contains('\n') {
-            out.extend(
-                contents
-                    .lines()
-                    // newline needs to be at the start, since we don't want the end
-                    // finishing with a newline - the closing suffix should be on the same line
-                    .map(|l| {
-                        format!(
-                            "\n{:width$}{l}",
-                            "",
-                            width = if l.is_empty() { 0 } else { indentation },
-                            l = l
-                        )
-                    })
-                    // `lines` removes the final line ending - add back
-                    .chain(Some(format!("\n{:width$}", "", width = indentation))),
-            );
+            out.push_str(if is_escape { "r###\"" } else { "\"" });
+            // if we have more than one line we want to change into the block
+            // representation mode
+            if contents.contains('\n') {
+                out.extend(
+                    contents
+                        .lines()
+                        // newline needs to be at the start, since we don't want the end
+                        // finishing with a newline - the closing suffix should be on the same line
+                        .map(|l| {
+                            format!(
+                                "\n{:width$}{l}",
+                                "",
+                                width = if l.is_empty() { 0 } else { indentation },
+                                l = l
+                            )
+                        })
+                        // `lines` removes the final line ending - add back
+                        .chain(Some(format!("\n{:width$}", "", width = indentation))),
+                );
+            } else {
+                out.push_str(contents);
+            }
+
+            out.push_str(if is_escape { "\"###" } else { "\"" });
+
+            Some(out)
         } else {
-            out.push_str(contents);
+            None
         }
-
-        out.push_str(if is_escape { "\"###" } else { "\"" });
-
-        out
     }
 }
 
@@ -575,26 +674,14 @@ impl<'a> From<Cow<'a, str>> for SnapshotContents {
 impl From<&str> for SnapshotContents {
     fn from(value: &str) -> SnapshotContents {
         // make sure we have unix newlines consistently
-        SnapshotContents(value.replace("\r\n", "\n"))
+        SnapshotContents::Str(value.replace("\r\n", "\n"))
     }
 }
 
 impl From<String> for SnapshotContents {
     fn from(value: String) -> SnapshotContents {
         // make sure we have unix newlines consistently
-        SnapshotContents(value.replace("\r\n", "\n"))
-    }
-}
-
-impl From<SnapshotContents> for String {
-    fn from(value: SnapshotContents) -> String {
-        value.0
-    }
-}
-
-impl PartialEq for SnapshotContents {
-    fn eq(&self, other: &Self) -> bool {
-        self.as_str() == other.as_str()
+        SnapshotContents::Str(value.replace("\r\n", "\n"))
     }
 }
 
@@ -685,14 +772,14 @@ fn get_inline_snapshot_value(frozen_value: &str) -> String {
 #[test]
 fn test_snapshot_contents() {
     use similar_asserts::assert_eq;
-    let snapshot_contents = SnapshotContents("testing".to_string());
-    assert_eq!(snapshot_contents.to_inline(0), r#""testing""#);
+    let snapshot_contents = SnapshotContents::Str("testing".to_string());
+    assert_eq!(snapshot_contents.to_inline(0).unwrap(), r#""testing""#);
 
     let t = &"
 a
 b"[1..];
     assert_eq!(
-        SnapshotContents(t.to_string()).to_inline(0),
+        SnapshotContents::Str(t.to_string()).to_inline(0).unwrap(),
         "r###\"
 a
 b
@@ -703,7 +790,7 @@ b
 a
 b"[1..];
     assert_eq!(
-        SnapshotContents(t.to_string()).to_inline(4),
+        SnapshotContents::Str(t.to_string()).to_inline(4).unwrap(),
         "r###\"
     a
     b
@@ -714,7 +801,7 @@ b"[1..];
     a
     b"[1..];
     assert_eq!(
-        SnapshotContents(t.to_string()).to_inline(0),
+        SnapshotContents::Str(t.to_string()).to_inline(0).unwrap(),
         "r###\"
     a
     b
@@ -726,7 +813,7 @@ b"[1..];
 
     b"[1..];
     assert_eq!(
-        SnapshotContents(t.to_string()).to_inline(0),
+        SnapshotContents::Str(t.to_string()).to_inline(0).unwrap(),
         "r###\"
     a
 
@@ -738,14 +825,17 @@ b"[1..];
     ab
 "[1..];
     assert_eq!(
-        SnapshotContents(t.to_string()).to_inline(0),
+        SnapshotContents::Str(t.to_string()).to_inline(0).unwrap(),
         "r###\"
     ab
 \"###"
     );
 
     let t = "ab";
-    assert_eq!(SnapshotContents(t.to_string()).to_inline(0), r#""ab""#);
+    assert_eq!(
+        SnapshotContents::Str(t.to_string()).to_inline(0).unwrap(),
+        r#""ab""#
+    );
 }
 
 #[test]

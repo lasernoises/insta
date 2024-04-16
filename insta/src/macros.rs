@@ -353,13 +353,30 @@ macro_rules! _assert_snapshot_base {
         $crate::_macro_support::assert_snapshot(
             $name.into(),
             #[allow(clippy::redundant_closure_call)]
-            &$transform(&$value),
+            $crate::_macro_support::SnapshotValue::Str(&$transform(&$value)),
             env!("CARGO_MANIFEST_DIR"),
             $crate::_function_name!(),
             module_path!(),
             file!(),
             line!(),
             $debug_expr,
+        )
+        .unwrap()
+    };
+}
+
+#[macro_export]
+macro_rules! assert_image_snapshot {
+    ($name:expr, $value:expr) => {
+        $crate::_macro_support::assert_snapshot(
+            $name.into(),
+            $crate::_macro_support::SnapshotValue::Image($value),
+            env!("CARGO_MANIFEST_DIR"),
+            $crate::_function_name!(),
+            module_path!(),
+            file!(),
+            line!(),
+            stringify!($value),
         )
         .unwrap()
     };

@@ -8,13 +8,15 @@ use std::path::{Path, PathBuf};
 use std::str;
 use std::sync::{Arc, Mutex};
 
+use image::DynamicImage;
+
 use crate::env::{
     get_cargo_workspace, get_tool_config, memoize_snapshot_file, snapshot_update_behavior,
     OutputBehavior, SnapshotUpdateBehavior, ToolConfig,
 };
 use crate::output::SnapshotPrinter;
 use crate::settings::Settings;
-use crate::snapshot::{MetaData, PendingInlineSnapshot, Snapshot, SnapshotContents};
+use crate::snapshot::{MetaData, PendingInlineSnapshot, Snapshot, SnapshotContents, SnapshotType};
 use crate::utils::{path_to_storage, style};
 
 lazy_static::lazy_static! {
@@ -334,6 +336,10 @@ impl<'a> SnapshotAssertionContext<'a> {
                     .input_file()
                     .and_then(|x| self.localize_path(x))
                     .map(|x| path_to_storage(&x)),
+                snapshot_type: match contents {
+                    SnapshotContents::Str(_) => SnapshotType::Str,
+                    SnapshotContents::Image(_) => SnapshotType::Image,
+                },
             }),
             contents,
         )
@@ -618,6 +624,12 @@ where
     }
 }
 
+pub enum SnapshotValue<'a> {
+    Str(&'a str),
+
+    Image(DynamicImage),
+}
+
 /// This function is invoked from the macros to run the main assertion logic.
 ///
 /// This will create the assertion context, run the main logic to assert
@@ -627,7 +639,7 @@ where
 #[allow(clippy::too_many_arguments)]
 pub fn assert_snapshot(
     refval: ReferenceValue<'_>,
-    new_snapshot_value: &str,
+    new_snapshot_value: SnapshotValue,
     manifest_dir: &str,
     function_name: &str,
     module_path: &str,
@@ -645,50 +657,93 @@ pub fn assert_snapshot(
     )?;
     let tool_config = get_tool_config(manifest_dir);
 
-    // apply filters if they are available
-    #[cfg(feature = "filters")]
-    let new_snapshot_value =
-        Settings::with(|settings| settings.filters().apply_to(new_snapshot_value));
+    match new_snapshot_value {
+        SnapshotValue::Str(new_snapshot_value) => {
+            // apply filters if they are available
+            #[cfg(feature = "filters")]
+            let new_snapshot_value =
+                Settings::with(|settings| settings.filters().apply_to(new_snapshot_value));
 
-    let new_snapshot = ctx.new_snapshot(new_snapshot_value.into(), expr);
+            let new_snapshot = ctx.new_snapshot(new_snapshot_value.into(), expr);
 
-    // memoize the snapshot file if requested.
-    if let Some(ref snapshot_file) = ctx.snapshot_file {
-        memoize_snapshot_file(snapshot_file);
-    }
-
-    // If we allow assertion with duplicates, we record the duplicate now.  This will
-    // in itself fail the assertion if the previous visit of the same assertion macro
-    // did not yield the same result.
-    RECORDED_DUPLICATES.with(|x| {
-        if let Some(results) = x.borrow_mut().last_mut() {
-            record_snapshot_duplicate(results, &new_snapshot, &ctx);
-        }
-    });
-
-    let pass = ctx
-        .old_snapshot
-        .as_ref()
-        .map(|x| {
-            if tool_config.require_full_match() {
-                x.matches_fully(&new_snapshot)
-            } else {
-                x.matches(&new_snapshot)
+            // memoize the snapshot file if requested.
+            if let Some(ref snapshot_file) = ctx.snapshot_file {
+                memoize_snapshot_file(snapshot_file);
             }
-        })
-        .unwrap_or(false);
 
-    if pass {
-        ctx.cleanup_passing()?;
+            // If we allow assertion with duplicates, we record the duplicate now.  This will
+            // in itself fail the assertion if the previous visit of the same assertion macro
+            // did not yield the same result.
+            RECORDED_DUPLICATES.with(|x| {
+                if let Some(results) = x.borrow_mut().last_mut() {
+                    record_snapshot_duplicate(results, &new_snapshot, &ctx);
+                }
+            });
 
-        if tool_config.force_update_snapshots() {
-            ctx.update_snapshot(new_snapshot)?;
+            let pass = ctx
+                .old_snapshot
+                .as_ref()
+                .map(|x| {
+                    if tool_config.require_full_match() {
+                        x.matches_fully(&new_snapshot)
+                    } else {
+                        x.matches(&new_snapshot)
+                    }
+                })
+                .unwrap_or(false);
+
+            if pass {
+                ctx.cleanup_passing()?;
+
+                if tool_config.force_update_snapshots() {
+                    ctx.update_snapshot(new_snapshot)?;
+                }
+            // otherwise print information and update snapshots.
+            } else {
+                print_snapshot_info(&ctx, &new_snapshot);
+                let update_result = ctx.update_snapshot(new_snapshot)?;
+                finalize_assertion(&ctx, update_result);
+            }
         }
-    // otherwise print information and update snapshots.
-    } else {
-        print_snapshot_info(&ctx, &new_snapshot);
-        let update_result = ctx.update_snapshot(new_snapshot)?;
-        finalize_assertion(&ctx, update_result);
+        SnapshotValue::Image(new_snapshot_value) => {
+            let new_snapshot = ctx.new_snapshot(SnapshotContents::Image(new_snapshot_value), expr);
+
+            // If we allow assertion with duplicates, we record the duplicate now.  This will
+            // in itself fail the assertion if the previous visit of the same assertion macro
+            // did not yield the same result.
+            RECORDED_DUPLICATES.with(|x| {
+                if let Some(results) = x.borrow_mut().last_mut() {
+                    record_snapshot_duplicate(results, &new_snapshot, &ctx);
+                }
+            });
+
+            let pass = ctx
+                .old_snapshot
+                .as_ref()
+                .map(|x| {
+                    if tool_config.require_full_match() {
+                        x.matches_fully(&new_snapshot)
+                    } else {
+                        x.matches(&new_snapshot)
+                    }
+                })
+                .unwrap_or(false);
+
+            // let pass = false;
+
+            if pass {
+                ctx.cleanup_passing()?;
+
+                if tool_config.force_update_snapshots() {
+                    ctx.update_snapshot(new_snapshot)?;
+                }
+            // otherwise print information and update snapshots.
+            } else {
+                // print_snapshot_info(&ctx, &new_snapshot);
+                let update_result = ctx.update_snapshot(new_snapshot)?;
+                finalize_assertion(&ctx, update_result);
+            }
+        }
     }
 
     Ok(())

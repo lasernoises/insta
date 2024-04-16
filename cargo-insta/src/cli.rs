@@ -239,7 +239,8 @@ fn query_snapshot(
     line: Option<u32>,
     i: usize,
     n: usize,
-    snapshot_file: Option<&Path>,
+    new_path: &Path,
+    old_path: Option<&Path>,
     show_info: &mut bool,
     show_diff: &mut bool,
 ) -> Result<Operation, Box<dyn Error>> {
@@ -261,7 +262,7 @@ fn query_snapshot(
         );
 
         let mut printer = SnapshotPrinter::new(workspace_root, old, new);
-        printer.set_snapshot_file(snapshot_file);
+        printer.set_snapshot_file(old_path);
         printer.set_line(line);
         printer.set_show_info(*show_info);
         printer.set_show_diff(*show_diff);
@@ -306,6 +307,14 @@ fn query_snapshot(
             style("toggle snapshot diff").dim()
         );
 
+        if new.contents().is_image() || old.is_some_and(|o| o.contents().is_image()) {
+            println!(
+                "  {} open       {}",
+                style("o").cyan().bold(),
+                style("open snapshot files in external tool").dim()
+            );
+        }
+
         loop {
             match term.read_key()? {
                 Key::Char('a') | Key::Enter => return Ok(Operation::Accept),
@@ -317,6 +326,16 @@ fn query_snapshot(
                 }
                 Key::Char('d') => {
                     *show_diff = !*show_diff;
+                    break;
+                }
+                Key::Char('o') => {
+                    assert!(new.contents().is_image());
+                    let old_path = old.map(|_| Snapshot::image_path(old_path.unwrap()));
+
+                    for path in old_path.into_iter().chain([Snapshot::image_path(new_path)]) {
+                        open::that_detached(path)?;
+                    }
+
                     break;
                 }
                 _ => {}
@@ -481,6 +500,7 @@ fn process_snapshots(
 
     for (snapshot_container, package) in snapshot_containers.iter_mut() {
         let target_file = snapshot_container.target_file().to_path_buf();
+        let snapshot_path = snapshot_container.snapshot_path().to_path_buf();
         let snapshot_file = snapshot_container.snapshot_file().map(|x| x.to_path_buf());
         for snapshot_ref in snapshot_container.iter_snapshots() {
             // if a filter is provided, check if the snapshot reference is included
@@ -508,6 +528,7 @@ fn process_snapshots(
                     snapshot_ref.line,
                     num,
                     snapshot_count,
+                    &snapshot_path,
                     snapshot_file.as_deref(),
                     &mut show_info,
                     &mut show_diff,
@@ -1004,8 +1025,8 @@ fn pending_snapshots_cmd(cmd: PendingSnapshotsCommand) -> Result<(), Box<dyn Err
                         path: &target_file,
                         line: snapshot_ref.line.unwrap(),
                         name: snapshot_ref.new.snapshot_name(),
-                        old_snapshot: snapshot_ref.old.as_ref().map(|x| x.contents_str()),
-                        new_snapshot: snapshot_ref.new.contents_str(),
+                        old_snapshot: snapshot_ref.old.as_ref().map(|x| x.contents_str().unwrap()),
+                        new_snapshot: snapshot_ref.new.contents_str().unwrap(),
                         expression: snapshot_ref.new.metadata().expression(),
                     }
                 } else {

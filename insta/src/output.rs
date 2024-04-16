@@ -103,119 +103,211 @@ impl<'a> SnapshotPrinter<'a> {
     fn print_snapshot(&self) {
         print_line(term_width());
 
-        let new_contents = self.new_snapshot.contents_str();
+        let new_contents = self.new_snapshot.contents();
 
         let width = term_width();
         if self.show_info {
             self.print_info();
         }
         println!("Snapshot Contents:");
-        println!("──────┬{:─^1$}", "", width.saturating_sub(7));
-        for (idx, line) in new_contents.lines().enumerate() {
-            println!("{:>5} │ {}", style(idx + 1).cyan().dim().bold(), line);
+
+        match new_contents {
+            crate::snapshot::SnapshotContents::Str(new_contents) => {
+                println!("──────┬{:─^1$}", "", width.saturating_sub(7));
+                for (idx, line) in new_contents.lines().enumerate() {
+                    println!("{:>5} │ {}", style(idx + 1).cyan().dim().bold(), line);
+                }
+                println!("──────┴{:─^1$}", "", width.saturating_sub(7));
+            }
+            crate::snapshot::SnapshotContents::Image(image) => {
+                viuer::print(
+                    &image,
+                    &viuer::Config {
+                        width: Some((width as u32 / 2 - 1).min(64)),
+                        absolute_offset: false,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            }
         }
-        println!("──────┴{:─^1$}", "", width.saturating_sub(7));
     }
 
     fn print_changeset(&self) {
-        let old = self.old_snapshot.as_ref().map_or("", |x| x.contents_str());
-        let new = self.new_snapshot.contents_str();
-        let newlines_matter = newlines_matter(old, new);
-
         let width = term_width();
-        let diff = TextDiff::configure()
-            .algorithm(Algorithm::Patience)
-            .timeout(Duration::from_millis(500))
-            .diff_lines(old, new);
         print_line(width);
 
         if self.show_info {
             self.print_info();
         }
 
-        if !old.is_empty() {
-            println!(
-                "{}",
-                style(format_args!("-{}", self.old_snapshot_hint)).red()
-            );
-        }
-        println!(
-            "{}",
-            style(format_args!("+{}", self.new_snapshot_hint)).green()
-        );
+        match self.new_snapshot.contents() {
+            crate::snapshot::SnapshotContents::Str(new) => {
+                let old = self
+                    .old_snapshot
+                    .as_ref()
+                    .map_or("", |x| x.contents_str().unwrap());
+                let newlines_matter = newlines_matter(old, new);
+                let diff = TextDiff::configure()
+                    .algorithm(Algorithm::Patience)
+                    .timeout(Duration::from_millis(500))
+                    .diff_lines(old, new);
+                if !old.is_empty() {
+                    println!(
+                        "{}",
+                        style(format_args!("-{}", self.old_snapshot_hint)).red()
+                    );
+                }
+                println!(
+                    "{}",
+                    style(format_args!("+{}", self.new_snapshot_hint)).green()
+                );
 
-        println!("────────────┬{:─^1$}", "", width.saturating_sub(13));
-        let mut has_changes = false;
-        for (idx, group) in diff.grouped_ops(4).iter().enumerate() {
-            if idx > 0 {
-                println!("┈┈┈┈┈┈┈┈┈┈┈┈┼{:┈^1$}", "", width.saturating_sub(13));
-            }
-            for op in group {
-                for change in diff.iter_inline_changes(op) {
-                    match change.tag() {
-                        ChangeTag::Insert => {
-                            has_changes = true;
-                            print!(
-                                "{:>5} {:>5} │{}",
-                                "",
-                                style(change.new_index().unwrap()).cyan().dim().bold(),
-                                style("+").green(),
-                            );
-                            for &(emphasized, change) in change.values() {
-                                let change = render_invisible(change, newlines_matter);
-                                if emphasized {
-                                    print!("{}", style(change).green().underlined());
-                                } else {
-                                    print!("{}", style(change).green());
-                                }
-                            }
-                        }
-                        ChangeTag::Delete => {
-                            has_changes = true;
-                            print!(
-                                "{:>5} {:>5} │{}",
-                                style(change.old_index().unwrap()).cyan().dim(),
-                                "",
-                                style("-").red(),
-                            );
-                            for &(emphasized, change) in change.values() {
-                                let change = render_invisible(change, newlines_matter);
-                                if emphasized {
-                                    print!("{}", style(change).red().underlined());
-                                } else {
-                                    print!("{}", style(change).red());
-                                }
-                            }
-                        }
-                        ChangeTag::Equal => {
-                            print!(
-                                "{:>5} {:>5} │ ",
-                                style(change.old_index().unwrap()).cyan().dim(),
-                                style(change.new_index().unwrap()).cyan().dim().bold(),
-                            );
-                            for &(_, change) in change.values() {
-                                let change = render_invisible(change, newlines_matter);
-                                print!("{}", style(change).dim());
-                            }
-                        }
+                println!("────────────┬{:─^1$}", "", width.saturating_sub(13));
+                let mut has_changes = false;
+                for (idx, group) in diff.grouped_ops(4).iter().enumerate() {
+                    if idx > 0 {
+                        println!("┈┈┈┈┈┈┈┈┈┈┈┈┼{:┈^1$}", "", width.saturating_sub(13));
                     }
-                    if change.missing_newline() {
-                        println!();
+                    for op in group {
+                        for change in diff.iter_inline_changes(op) {
+                            match change.tag() {
+                                ChangeTag::Insert => {
+                                    has_changes = true;
+                                    print!(
+                                        "{:>5} {:>5} │{}",
+                                        "",
+                                        style(change.new_index().unwrap()).cyan().dim().bold(),
+                                        style("+").green(),
+                                    );
+                                    for &(emphasized, change) in change.values() {
+                                        let change = render_invisible(change, newlines_matter);
+                                        if emphasized {
+                                            print!("{}", style(change).green().underlined());
+                                        } else {
+                                            print!("{}", style(change).green());
+                                        }
+                                    }
+                                }
+                                ChangeTag::Delete => {
+                                    has_changes = true;
+                                    print!(
+                                        "{:>5} {:>5} │{}",
+                                        style(change.old_index().unwrap()).cyan().dim(),
+                                        "",
+                                        style("-").red(),
+                                    );
+                                    for &(emphasized, change) in change.values() {
+                                        let change = render_invisible(change, newlines_matter);
+                                        if emphasized {
+                                            print!("{}", style(change).red().underlined());
+                                        } else {
+                                            print!("{}", style(change).red());
+                                        }
+                                    }
+                                }
+                                ChangeTag::Equal => {
+                                    print!(
+                                        "{:>5} {:>5} │ ",
+                                        style(change.old_index().unwrap()).cyan().dim(),
+                                        style(change.new_index().unwrap()).cyan().dim().bold(),
+                                    );
+                                    for &(_, change) in change.values() {
+                                        let change = render_invisible(change, newlines_matter);
+                                        print!("{}", style(change).dim());
+                                    }
+                                }
+                            }
+                            if change.missing_newline() {
+                                println!();
+                            }
+                        }
                     }
                 }
+
+                if !has_changes {
+                    println!(
+                        "{:>5} {:>5} │{}",
+                        "",
+                        style("-").dim(),
+                        style(" snapshots are matching").cyan(),
+                    );
+                }
+
+                println!("────────────┴{:─^1$}", "", width.saturating_sub(13));
+            }
+            crate::snapshot::SnapshotContents::Image(new_image) => {
+                let image_width = (width as u16 / 2 - 1).min(64);
+
+                if self.old_snapshot.is_some() {
+                    print!(
+                        "{}",
+                        style(format_args!(
+                            "{:<1$}",
+                            self.old_snapshot_hint,
+                            image_width as usize + 1,
+                        ))
+                        .red()
+                    );
+                }
+                println!(
+                    "{}",
+                    style(format_args!("{}", self.new_snapshot_hint)).green()
+                );
+
+                let print_new = |x, restore_cursor| {
+                    viuer::print(
+                        new_image,
+                        &viuer::Config {
+                            x,
+                            width: Some(image_width as u32),
+                            height: None,
+                            absolute_offset: false,
+                            restore_cursor,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                };
+
+                if let Some(crate::snapshot::SnapshotContents::Image(old_image)) =
+                    self.old_snapshot.map(|s| s.contents())
+                {
+                    // These heights are in terms of the width of a terminal cell. As such they are not
+                    // directly useful for moving the cursor. Instead we can figure out which of the two
+                    // images is higher and draw that one last. The restore_cursor flag in viuer makes
+                    // use of escape sequences to save and restore the cursor position. This way the
+                    // terminal emulator does the job of knowing how high the image is in terms of the
+                    // cell height. Otherwise we'd have to use os specific crates for querying the cell
+                    // size.
+                    let new_height = new_image.height() * image_width as u32 / new_image.width();
+                    let old_height = old_image.height() * image_width as u32 / old_image.width();
+                    let new_first = new_height < old_height;
+
+                    if new_first {
+                        print_new(image_width + 1, true);
+                    }
+
+                    viuer::print(
+                        old_image,
+                        &viuer::Config {
+                            width: Some(image_width as u32),
+                            height: None,
+                            absolute_offset: false,
+                            restore_cursor: !new_first,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+
+                    if !new_first {
+                        print_new(image_width + 1, false);
+                    }
+                } else {
+                    print_new(0, false);
+                };
             }
         }
-
-        if !has_changes {
-            println!(
-                "{:>5} {:>5} │{}",
-                "",
-                style("-").dim(),
-                style(" snapshots are matching").cyan(),
-            );
-        }
-
-        println!("────────────┴{:─^1$}", "", width.saturating_sub(13));
     }
 }
 
